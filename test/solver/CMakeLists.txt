@@ -20,3 +20,7 @@ if(IPPL_ENABLE_FFT)
   add_ippl_integration_test(TestGaussian_hessian LABELS solver integration)
   add_ippl_integration_test(TestFFTTruncatedGreenPeriodicPoissonSolver LABELS solver integration)
 endif()
+
+if(IPPL_ENABLE_GINKGO)
+    target_link_libraries(TestCGSolver PRIVATE Ginkgo::ginkgo)
+endif()

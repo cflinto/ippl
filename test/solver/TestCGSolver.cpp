@@ -18,6 +18,10 @@
 
 #include "PoissonSolvers/PoissonCG.h"
 
+#ifdef ENABLE_GINKGO
+#include <ginkgo/ginkgo.hpp>
+#endif
+
 int main(int argc, char* argv[]) {
     ippl::initialize(argc, argv);
     {
@@ -230,6 +234,71 @@ int main(int argc, char* argv[]) {
 
         lhs = 0;
         info << "Solver is set up" << endl;
+
+#ifdef ENABLE_GINKGO
+        // Test: Just intercept the data and wrap it in Ginkgo views.
+        info << "--- GINKGO INTERCEPTION START ---" << endl;
+
+        auto gko_exec = gko::ReferenceExecutor::create();
+        auto gko_viewLHS = lhs.getView();
+        auto gko_viewRHS = rhs.getView();
+
+        // Calculate total 1D size of the 3D grid
+        size_t total_size = gko_viewLHS.extent(0) * gko_viewLHS.extent(1) * gko_viewLHS.extent(2);
+
+        // Wrap the raw Kokkos pointers into Ginkgo Dense Matrices
+        // Avoid copy by constructing the view inline (as a temporary).
+        auto gko_x = gko::matrix::Dense<double>::create(
+            gko_exec, gko::dim<2>{total_size, 1}, 
+            gko::array<double>::view(gko_exec, total_size, gko_viewLHS.data()), 
+            1); // 1 is the stride
+            
+        auto gko_b = gko::matrix::Dense<double>::create(
+            gko_exec, gko::dim<2>{total_size, 1}, 
+            gko::array<double>::view(gko_exec, total_size, gko_viewRHS.data()), 
+            1); // 1 is the stride
+
+        info << "Successfully wrapped Kokkos Views in Ginkgo Dense vectors!" << endl;
+        
+        // Let's be paranoid: verify that the Ginkgo views are indeed pointing to the same memory as the Kokkos views, and that mutating one mutates the other. This is the crux of zero-copy interoperability.
+
+        // Proof 1: Check the raw hardware memory addresses
+        const double* kokkos_ptr = gko_viewRHS.data();
+        const double* ginkgo_ptr = gko_b->get_const_values();
+        
+        info << "Kokkos memory address: " << kokkos_ptr << endl;
+        info << "Ginkgo memory address: " << ginkgo_ptr << endl;
+        
+        if (kokkos_ptr == ginkgo_ptr) {
+            info << "SUCCESS: Addresses match! Ginkgo is using Kokkos memory directly." << endl;
+        } else {
+            info << "WARNING: Addresses differ. A copy occurred!" << endl;
+        }
+
+        // Proof 2: Mutate the data in Kokkos and see if Ginkgo instantly sees it
+        double original_val = gko_viewRHS(0, 0, 0);
+        gko_viewRHS(0, 0, 0) = 9999.99; // Mutate via Kokkos
+        
+        double ginkgo_val = gko_b->at(0, 0); // Read back via Ginkgo
+        
+        info << "Mutated value in Kokkos: 9999.99" << endl;
+        info << "Value read from Ginkgo:  " << ginkgo_val << endl;
+        
+        gko_viewRHS(0, 0, 0) = original_val; // Restore the physics!
+        // ==========================================
+
+        // Prove Ginkgo can read the data that Kokkos generated!
+        auto gko_b_norm = gko::matrix::Dense<double>::create(gko_exec, gko::dim<2>{1, 1});
+        gko_b->compute_norm2(gko_b_norm);
+        
+        info << "Ginkgo computed RHS Norm2: " << gko_b_norm->at(0, 0) << endl;
+        info << "--- GINKGO INTERCEPTION END ---" << endl;
+#endif
+
+        // Debug: Compute the norm with IPPL, to check it's the same as Ginkgo's (it should be, since they point to the same data)
+        double ippl_rhs_norm = norm(rhs);
+        info << "IPPL computed RHS Norm2:   " << ippl_rhs_norm << endl;
+
         lapsolver.solve();
         info << "Solver is done" << endl;
 
