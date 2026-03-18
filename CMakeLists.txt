@@ -37,6 +37,7 @@ option(BUILD_SHARED_LIBS "Build IPPL as a shared library" OFF)
 option(IPPL_ENABLE_UNIT_TESTS "Enable unit tests using GoogleTest" OFF)
 option(IPPL_ENABLE_FFT "Enable FFT support" OFF)
 option(IPPL_ENABLE_SOLVERS "Enable IPPL solvers" OFF)
+option(IPPL_ENABLE_GINKGO "Enable Ginkgo backend" OFF)
 option(IPPL_ENABLE_ALPINE "Enable building the Alpine module" OFF)
 option(IPPL_ENABLE_COSMOLOGY "Enable building the Cosmology module" OFF)
 option(IPPL_ENABLE_EXAMPLES "Enable building the Example module" OFF)
@@ -97,6 +98,17 @@ if(DEFINED USE_ALTERNATIVE_VARIANT)
     WARNING ${Red}
     "USE_ALTERNATIVE_VARIANT is deprecated. Please set IPPL_USE_ALTERNATIVE_VARIANT instead.")
   set(IPPL_USE_ALTERNATIVE_VARIANT ${USE_ALTERNATIVE_VARIANT} CACHE BOOL "" FORCE)
+endif()
+
+# ------------------------------------------------------------------------------
+# External Dependencies
+# ------------------------------------------------------------------------------
+if(IPPL_ENABLE_GINKGO)
+  message(STATUS "✅ Ginkgo backend is ENABLED")
+  find_package(Ginkgo REQUIRED)
+  add_compile_definitions(ENABLE_GINKGO)
+else()
+  message(STATUS "❌ Ginkgo backend is DISABLED")
 endif()
 
 # ------------------------------------------------------------------------------
