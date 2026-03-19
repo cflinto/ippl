@@ -22,6 +22,96 @@
 #include <ginkgo/ginkgo.hpp>
 #endif
 
+
+
+#ifdef ENABLE_GINKGO
+// Custom Ginkgo Operator that wraps IPPL's matrix-free Laplacian
+template <typename FieldType>
+class IpplLaplaceOp : public gko::EnableLinOp<IpplLaplaceOp<FieldType>>,
+                      public gko::EnableCreateMethod<IpplLaplaceOp<FieldType>> {
+public:
+    // 1. Required by Ginkgo's polymorphic architecture
+    IpplLaplaceOp(std::shared_ptr<const gko::Executor> exec)
+        : gko::EnableLinOp<IpplLaplaceOp<FieldType>>(exec) {}
+
+    // 2. Our actual physics constructor
+    IpplLaplaceOp(std::shared_ptr<const gko::Executor> exec, gko::dim<2> size,
+                  FieldType& templated_field)
+        : gko::EnableLinOp<IpplLaplaceOp<FieldType>>(exec, size)
+    {
+        // Use shared_ptr so the class remains copy-assignable (required by Ginkgo!)
+        temp_in_ = std::make_shared<FieldType>(templated_field.get_mesh(), templated_field.getLayout());
+        temp_out_ = std::make_shared<FieldType>(templated_field.get_mesh(), templated_field.getLayout());
+        
+        // Copy boundary conditions so the physics remain correct
+        temp_in_->setFieldBC(templated_field.getFieldBC());
+        temp_out_->setFieldBC(templated_field.getFieldBC());
+    }
+
+protected:
+    // This is the basic function: out = A * in
+    void apply_impl(const gko::LinOp* in, gko::LinOp* out) const override {
+        auto dense_in = gko::as<gko::matrix::Dense<double>>(in);
+        auto dense_out = gko::as<gko::matrix::Dense<double>>(out);
+
+        auto view_in = temp_in_->getView();
+        auto ext1 = view_in.extent(1); 
+        auto ext2 = view_in.extent(2);
+        const double* gko_in_data = dense_in->get_const_values();
+        
+        // 1. Move Ginkgo's current vector state into the IPPL Field
+        Kokkos::parallel_for("CopyIn", temp_in_->getFieldRangePolicy(),
+            KOKKOS_LAMBDA(const int i, const int j, const int k) {
+                size_t flat_idx = i * ext1 * ext2 + j * ext2 + k;
+                view_in(i, j, k) = gko_in_data[flat_idx];
+            });
+        Kokkos::fence(); // Wait for copy
+
+        // 2. APPLY IPPL'S NATIVE MATRIX-FREE LAPLACIAN!
+        *temp_out_ = -laplace(*temp_in_);
+        Kokkos::fence(); // Wait for physics
+
+        // 3. Move the physics result back into Ginkgo's vector
+        auto view_out = temp_out_->getView();
+        double* gko_out_data = dense_out->get_values();
+        
+        Kokkos::parallel_for("CopyOut", temp_out_->getFieldRangePolicy(),
+            KOKKOS_LAMBDA(const int i, const int j, const int k) {
+                size_t flat_idx = i * ext1 * ext2 + j * ext2 + k;
+                gko_out_data[flat_idx] = view_out(i, j, k);
+            });
+        Kokkos::fence();
+    }
+
+    // The advanced function: out = alpha * A * in + beta * out
+    void apply_impl(const gko::LinOp* alpha, const gko::LinOp* in,
+                    const gko::LinOp* beta, gko::LinOp* out) const override {
+        auto dense_out = gko::as<gko::matrix::Dense<double>>(out);
+        auto dense_alpha = gko::as<gko::matrix::Dense<double>>(alpha);
+        auto dense_beta = gko::as<gko::matrix::Dense<double>>(beta);
+
+        // 1. Create a temporary Ginkgo vector to hold A * in
+        auto temp_result = gko::matrix::Dense<double>::create(
+            this->get_executor(), dense_out->get_size());
+
+        // 2. Call our basic apply_impl to compute (A * in) -> temp_result
+        this->apply_impl(in, temp_result.get());
+
+        // 3. Scale the existing out vector: out = beta * out
+        dense_out->scale(dense_beta);
+
+        // 4. Add the new result: out = out + alpha * temp_result
+        dense_out->add_scaled(dense_alpha, temp_result.get());
+    }
+
+private:
+    mutable std::shared_ptr<FieldType> temp_in_;
+    mutable std::shared_ptr<FieldType> temp_out_;
+};
+#endif
+
+
+
 int main(int argc, char* argv[]) {
     ippl::initialize(argc, argv);
     {
@@ -293,13 +383,37 @@ int main(int argc, char* argv[]) {
         
         info << "Ginkgo computed RHS Norm2: " << gko_b_norm->at(0, 0) << endl;
         info << "--- GINKGO INTERCEPTION END ---" << endl;
+
+        info << "Setting up Ginkgo CG Solver..." << endl;
+        
+        // Instantiate our custom IPPL-wrapper operator
+        auto A_matrix = gko::share(IpplLaplaceOp<field_type>::create(gko_exec, gko::dim<2>{total_size, total_size}, lhs));
+
+        // Build Ginkgo's CG Solver
+        auto gko_cg_factory = gko::solver::Cg<double>::build()
+            .with_criteria(
+                gko::stop::Iteration::build().with_max_iters(500u).on(gko_exec),
+                gko::stop::ResidualNorm<double>::build().with_reduction_factor(1e-9).on(gko_exec)
+            )
+            .on(gko_exec);
+            
+        auto gko_solver = gko_cg_factory->generate(A_matrix);
+
+        // 3. GINKGO SOLVES THE SYSTEM!
+        info << "Ginkgo is solving A * x = b ..." << endl;
+        gko_solver->apply(gko_b, gko_x);
+        
+        info << "Ginkgo solver finished!" << endl;
+        info << "--- GINKGO INTERCEPTION END ---" << endl;
 #endif
 
         // Debug: Compute the norm with IPPL, to check it's the same as Ginkgo's (it should be, since they point to the same data)
         double ippl_rhs_norm = norm(rhs);
         info << "IPPL computed RHS Norm2:   " << ippl_rhs_norm << endl;
 
-        lapsolver.solve();
+        // IPPL solve: (we try to get rid of it!)
+        // lapsolver.solve(); 
+        
         info << "Solver is done" << endl;
 
         const char* name = isWeak ? "Convergence (weak)" : "Convergence";
