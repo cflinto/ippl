@@ -1,8 +1,8 @@
 // Tests the conjugate gradient solver for Poisson problems
-// by checking the relative error from the exact solution
 // Usage:
-//      TestCGSolver [size [scaling_type , preconditioner]]
-//      ./TestCGSolver 6 j --info 5
+//      ./TestCGSolver 6 native
+//      ./TestCGSolver 6 gko_mf
+//      ./TestCGSolver 6 gko_csr
 
 #include "Ippl.h"
 
@@ -11,21 +11,20 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
-#include <typeinfo>
+#include <memory>
+#include <stdexcept>
+#include <array>
 
 #include "Utility/Inform.h"
 #include "Utility/IpplTimings.h"
-
 #include "PoissonSolvers/PoissonCG.h"
 
-// ============================================================================
-// STEP 1: THE GINKGO OPERATOR (MATRIX-FREE PHYSICS)
-// ============================================================================
 #ifdef ENABLE_GINKGO
-
 #include <ginkgo/ginkgo.hpp>
 
-
+// ============================================================================
+// 1. THE MATRIX-FREE OPERATOR (LOW MEMORY MODE)
+// ============================================================================
 template <typename FieldType>
 class IpplLaplaceOp : public gko::EnableLinOp<IpplLaplaceOp<FieldType>>,
                       public gko::EnableCreateMethod<IpplLaplaceOp<FieldType>> {
@@ -33,9 +32,11 @@ public:
     IpplLaplaceOp(std::shared_ptr<const gko::Executor> exec)
         : gko::EnableLinOp<IpplLaplaceOp<FieldType>>(exec) {}
 
+    // NEW: We now pass the topology parameters so the Operator knows how to skip ghost cells
     IpplLaplaceOp(std::shared_ptr<const gko::Executor> exec, gko::dim<2> size,
-                  FieldType& templated_field)
-        : gko::EnableLinOp<IpplLaplaceOp<FieldType>>(exec, size)
+                  FieldType& templated_field, int nx, int ny, int nz, int nghost)
+        : gko::EnableLinOp<IpplLaplaceOp<FieldType>>(exec, size),
+          nx_(nx), ny_(ny), nz_(nz), nghost_(nghost)
     {
         temp_in_ = std::make_shared<FieldType>(templated_field.get_mesh(), templated_field.getLayout());
         temp_out_ = std::make_shared<FieldType>(templated_field.get_mesh(), templated_field.getLayout());
@@ -49,14 +50,18 @@ protected:
         auto dense_out = gko::as<gko::matrix::Dense<double>>(out);
 
         auto view_in = temp_in_->getView();
-        auto ext1 = view_in.extent(1); 
-        auto ext2 = view_in.extent(2);
         const double* gko_in_data = dense_in->get_const_values();
         
+        // Copy to local variables for safe CUDA lambda capture
+        int nghost = nghost_;
+        int ny = ny_;
+        int nz = nz_;
+        
+        // Scatter: 1D Contiguous Ginkgo (128^3) -> 3D Padded IPPL (130^3)
         Kokkos::parallel_for("CopyIn", temp_in_->getFieldRangePolicy(),
             KOKKOS_LAMBDA(const int i, const int j, const int k) {
-                size_t flat_idx = i * ext1 * ext2 + j * ext2 + k;
-                view_in(i, j, k) = gko_in_data[flat_idx];
+                int row = (i - nghost) * ny * nz + (j - nghost) * nz + (k - nghost);
+                view_in(i, j, k) = gko_in_data[row];
             });
         Kokkos::fence();
 
@@ -66,10 +71,11 @@ protected:
         auto view_out = temp_out_->getView();
         double* gko_out_data = dense_out->get_values();
         
+        // Gather: 3D Padded IPPL (130^3) -> 1D Contiguous Ginkgo (128^3)
         Kokkos::parallel_for("CopyOut", temp_out_->getFieldRangePolicy(),
             KOKKOS_LAMBDA(const int i, const int j, const int k) {
-                size_t flat_idx = i * ext1 * ext2 + j * ext2 + k;
-                gko_out_data[flat_idx] = view_out(i, j, k);
+                int row = (i - nghost) * ny * nz + (j - nghost) * nz + (k - nghost);
+                gko_out_data[row] = view_out(i, j, k);
             });
         Kokkos::fence();
     }
@@ -80,19 +86,25 @@ protected:
         auto dense_alpha = gko::as<gko::matrix::Dense<double>>(alpha);
         auto dense_beta = gko::as<gko::matrix::Dense<double>>(beta);
 
-        auto temp_result = gko::matrix::Dense<double>::create(this->get_executor(), dense_out->get_size());
-        this->apply_impl(in, temp_result.get());
+        // Lazily allocate ONCE and reuse it (using shared_ptr so the class remains copy-assignable)
+        if (!temp_math_result_) {
+            temp_math_result_ = gko::share(gko::matrix::Dense<double>::create(this->get_executor(), dense_out->get_size()));
+        }
+        
+        this->apply_impl(in, temp_math_result_.get());
         dense_out->scale(dense_beta);
-        dense_out->add_scaled(dense_alpha, temp_result.get());
+        dense_out->add_scaled(dense_alpha, temp_math_result_.get());
     }
 
 private:
+    mutable std::shared_ptr<gko::matrix::Dense<double>> temp_math_result_;
     mutable std::shared_ptr<FieldType> temp_in_;
     mutable std::shared_ptr<FieldType> temp_out_;
+    int nx_, ny_, nz_, nghost_;
 };
 
 // ============================================================================
-// STEP 2: THE TRUE CSR GINKGO SOLVER CLASS (GPU + MEMORY BRIDGE)
+// 2. THE UNIFIED SOLVER (TOGGLES BETWEEN CSR AND MATRIX-FREE)
 // ============================================================================
 template <typename FieldType>
 class PoissonGinkgo {
@@ -103,6 +115,7 @@ public:
         params_m.add("solver_type", "cg");
         params_m.add("tolerance", 1e-9);
         params_m.add("max_iterations", 500);
+        params_m.add("matrix_free", true); 
     }
 
     void mergeParameters(ippl::ParameterList& params) { params_m.merge(params); }
@@ -117,60 +130,55 @@ public:
     int getIterationCount() const { return itCount_; }
 
     void setup() {
-        // Safe Executor Bootup
-        omp_exec_ = gko::OmpExecutor::create();
-        try {
-            exec_ = gko::CudaExecutor::create(0, omp_exec_);
-        } catch (...) {
-            std::cout << "CUDA failed, falling back to OMP." << std::endl;
-            exec_ = omp_exec_;
-        }
+        exec_ = gko::OmpExecutor::create();
 
+        bool is_matrix_free = params_m.template get<bool>("matrix_free");
         std::string solver_type = params_m.template get<std::string>("solver_type");
         double tolerance = params_m.template get<double>("tolerance");
         int max_iters = params_m.template get<int>("max_iterations");
 
         int N = nx_ * ny_ * nz_;
-        
-        // Allocate Device memory natively in Ginkgo
-        gko_b_ = gko::matrix::Dense<value_type>::create(exec_, gko::dim<2>{(size_t)N, 1});
-        gko_x_ = gko::matrix::Dense<value_type>::create(exec_, gko::dim<2>{(size_t)N, 1});
+        std::shared_ptr<const gko::LinOp> system_matrix;
 
-        // 1. ASSEMBLE CSR MATRIX
-        gko::matrix_data<value_type, int> md{gko::dim<2>{(size_t)N, (size_t)N}};
-        double inv_dx2 = 1.0 / (dx_ * dx_);
-        double inv_dy2 = 1.0 / (dy_ * dy_);
-        double inv_dz2 = 1.0 / (dz_ * dz_);
-        double diag = 2.0 * (inv_dx2 + inv_dy2 + inv_dz2);
+        if (is_matrix_free) {
+            int nghost = lhs_mp->getNghost();
+            system_matrix = gko::share(IpplLaplaceOp<FieldType>::create(
+                exec_, gko::dim<2>{(size_t)N, (size_t)N}, *lhs_mp, nx_, ny_, nz_, nghost));
+        } else {
+            gko::matrix_data<value_type, int> md{gko::dim<2>{(size_t)N, (size_t)N}};
+            double inv_dx2 = 1.0 / (dx_ * dx_);
+            double inv_dy2 = 1.0 / (dy_ * dy_);
+            double inv_dz2 = 1.0 / (dz_ * dz_);
+            double diag = 2.0 * (inv_dx2 + inv_dy2 + inv_dz2);
 
-        for (int i = 0; i < nx_; ++i) {
-            for (int j = 0; j < ny_; ++j) {
-                for (int k = 0; k < nz_; ++k) {
-                    int row = i * ny_ * nz_ + j * nz_ + k;
-                    md.nonzeros.emplace_back(row, row, diag);
+            for (int i = 0; i < nx_; ++i) {
+                for (int j = 0; j < ny_; ++j) {
+                    for (int k = 0; k < nz_; ++k) {
+                        int row = i * ny_ * nz_ + j * nz_ + k;
+                        md.nonzeros.emplace_back(row, row, diag);
 
-                    int im = (i == 0) ? nx_ - 1 : i - 1;
-                    int ip = (i == nx_ - 1) ? 0 : i + 1;
-                    md.nonzeros.emplace_back(row, im * ny_ * nz_ + j * nz_ + k, -inv_dx2);
-                    md.nonzeros.emplace_back(row, ip * ny_ * nz_ + j * nz_ + k, -inv_dx2);
+                        int im = (i == 0) ? nx_ - 1 : i - 1;
+                        int ip = (i == nx_ - 1) ? 0 : i + 1;
+                        md.nonzeros.emplace_back(row, im * ny_ * nz_ + j * nz_ + k, -inv_dx2);
+                        md.nonzeros.emplace_back(row, ip * ny_ * nz_ + j * nz_ + k, -inv_dx2);
 
-                    int jm = (j == 0) ? ny_ - 1 : j - 1;
-                    int jp = (j == ny_ - 1) ? 0 : j + 1;
-                    md.nonzeros.emplace_back(row, i * ny_ * nz_ + jm * nz_ + k, -inv_dy2);
-                    md.nonzeros.emplace_back(row, i * ny_ * nz_ + jp * nz_ + k, -inv_dy2);
+                        int jm = (j == 0) ? ny_ - 1 : j - 1;
+                        int jp = (j == ny_ - 1) ? 0 : j + 1;
+                        md.nonzeros.emplace_back(row, i * ny_ * nz_ + jm * nz_ + k, -inv_dy2);
+                        md.nonzeros.emplace_back(row, i * ny_ * nz_ + jp * nz_ + k, -inv_dy2);
 
-                    int km = (k == 0) ? nz_ - 1 : k - 1;
-                    int kp = (k == nz_ - 1) ? 0 : k + 1;
-                    md.nonzeros.emplace_back(row, i * ny_ * nz_ + j * nz_ + km, -inv_dz2);
-                    md.nonzeros.emplace_back(row, i * ny_ * nz_ + j * nz_ + kp, -inv_dz2);
+                        int km = (k == 0) ? nz_ - 1 : k - 1;
+                        int kp = (k == nz_ - 1) ? 0 : k + 1;
+                        md.nonzeros.emplace_back(row, i * ny_ * nz_ + j * nz_ + km, -inv_dz2);
+                        md.nonzeros.emplace_back(row, i * ny_ * nz_ + j * nz_ + kp, -inv_dz2);
+                    }
                 }
             }
+            auto csr_mat = gko::share(gko::matrix::Csr<value_type, int>::create(exec_));
+            csr_mat->read(md);
+            system_matrix = csr_mat;
         }
-        
-        auto system_matrix = gko::share(gko::matrix::Csr<value_type, int>::create(exec_));
-        system_matrix->read(md); 
 
-        // 2. CONFIGURE SOLVER
         std::shared_ptr<gko::LinOpFactory> solver_factory;
         if (solver_type == "cg") {
             solver_factory = gko::solver::Cg<value_type>::build()
@@ -193,59 +201,39 @@ public:
 
     void solve() {
         int N = nx_ * ny_ * nz_;
-        int nghost = rhs_mp->getNghost();
         auto view_rhs = rhs_mp->getView();
         auto view_lhs = lhs_mp->getView();
-        int ny = ny_, nz = nz_; 
-
-        // A. Pack data in IPPL's native memory space
-        Kokkos::View<double*> staging_b("staging_b", N);
-        Kokkos::View<double*> staging_x("staging_x", N);
-
-        Kokkos::parallel_for("PackToGinkgo", rhs_mp->getFieldRangePolicy(),
+        
+        // BOTH modes must use staging buffers to drop the ghost cell padding!
+        staging_b_ = Kokkos::View<double*>("staging_b", N);
+        staging_x_ = Kokkos::View<double*>("staging_x", N);
+        
+        int nghost = rhs_mp->getNghost();
+        int ny = ny_, nz = nz_;
+        
+        Kokkos::parallel_for("PackGhostCells", rhs_mp->getFieldRangePolicy(),
             KOKKOS_LAMBDA(const int i, const int j, const int k) {
-                int ii = i - nghost;
-                int jj = j - nghost;
-                int kk = k - nghost;
-                int row = ii * ny * nz + jj * nz + kk;
-                staging_b(row) = view_rhs(i, j, k);
-                staging_x(row) = view_lhs(i, j, k); 
+                int row = (i - nghost) * ny * nz + (j - nghost) * nz + (k - nghost);
+                staging_b_(row) = view_rhs(i, j, k);
+                staging_x_(row) = view_lhs(i, j, k); 
             });
         Kokkos::fence();
 
-        // B. Memory Bridge: Safely guarantee the data is on the CPU Host
-        auto host_b = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), staging_b);
-        auto host_x = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), staging_x);
+        auto gko_b = gko::share(gko::matrix::Dense<value_type>::create(
+            exec_, gko::dim<2>{(size_t)N, 1}, 
+            gko::array<value_type>::view(exec_, N, staging_b_.data()), 1));
+        auto gko_x = gko::share(gko::matrix::Dense<value_type>::create(
+            exec_, gko::dim<2>{(size_t)N, 1}, 
+            gko::array<value_type>::view(exec_, N, staging_x_.data()), 1));
 
-        // C. Wrap Host memory for Ginkgo (using non-owning array views)
-        auto gko_host_b = gko::matrix::Dense<value_type>::create(
-            omp_exec_, gko::dim<2>{(size_t)N, 1}, 
-            gko::array<value_type>::view(omp_exec_, N, host_b.data()), 1);
-            
-        auto gko_host_x = gko::matrix::Dense<value_type>::create(
-            omp_exec_, gko::dim<2>{(size_t)N, 1}, 
-            gko::array<value_type>::view(omp_exec_, N, host_x.data()), 1);
-
-        // D. Push safely to GPU
-        gko_b_->copy_from(gko_host_b.get());
-        gko_x_->copy_from(gko_host_x.get());
-
-        // E. ACTUAL GPU MATH 
-        solver_->apply(gko_b_.get(), gko_x_.get());
+        // ACTUAL MATH
+        solver_->apply(gko_b.get(), gko_x.get());
         itCount_ = logger_->get_num_iterations();
 
-        // F. Pull safely from GPU
-        gko_host_x->copy_from(gko_x_.get());
-        Kokkos::deep_copy(staging_x, host_x); // Push back to Kokkos native space
-
-        // G. Unpack to IPPL Field
-        Kokkos::parallel_for("UnpackFromGinkgo", lhs_mp->getFieldRangePolicy(),
+        Kokkos::parallel_for("UnpackGhostCells", lhs_mp->getFieldRangePolicy(),
             KOKKOS_LAMBDA(const int i, const int j, const int k) {
-                int ii = i - nghost;
-                int jj = j - nghost;
-                int kk = k - nghost;
-                int row = ii * ny * nz + jj * nz + kk;
-                view_lhs(i, j, k) = staging_x(row);
+                int row = (i - nghost) * ny * nz + (j - nghost) * nz + (k - nghost);
+                view_lhs(i, j, k) = staging_x_(row);
             });
         Kokkos::fence();
     }
@@ -258,19 +246,18 @@ private:
     int nx_, ny_, nz_;
     double dx_, dy_, dz_;
     
-    // Core state tracking
-    std::shared_ptr<gko::Executor> omp_exec_;
     std::shared_ptr<gko::Executor> exec_;
-    std::unique_ptr<gko::matrix::Dense<value_type>> gko_b_;
-    std::unique_ptr<gko::matrix::Dense<value_type>> gko_x_;
     std::unique_ptr<gko::LinOp> solver_;
     std::shared_ptr<const gko::log::Convergence<value_type>> logger_;
+    
+    Kokkos::View<double*> staging_b_;
+    Kokkos::View<double*> staging_x_;
 };
 #endif // ENABLE_GINKGO
 
 
 // ============================================================================
-// STEP 3: THE BENCHMARK (MAIN)
+// 3. THE BENCHMARK (MAIN)
 // ============================================================================
 int main(int argc, char* argv[]) {
     ippl::initialize(argc, argv);
@@ -281,14 +268,14 @@ int main(int argc, char* argv[]) {
 
         int pt = 4, ptY = 4;
         bool isWeak = false;
-        std::string selected_solver = "native"; // Default
+        std::string selected_solver = "native"; 
         
         Inform info("Config");
         if (argc >= 2) {
             double N = strtol(argv[1], NULL, 10);
             pt = ptY = 1 << (int)N;
             if (argc >= 3) {
-                selected_solver = argv[2]; // Captures "native", "gko_cg", or "gko_gmres"
+                selected_solver = argv[2]; 
             }
         }
         
@@ -345,9 +332,6 @@ int main(int argc, char* argv[]) {
         lhs = 0;
         int itCount = 0;
 
-        // ====================================================================
-        // THE BENCHMARK TOGGLE
-        // ====================================================================
         if (selected_solver == "native") {
             ippl::PoissonCG<field_type> lapsolver;
             ippl::ParameterList params;
@@ -360,31 +344,36 @@ int main(int argc, char* argv[]) {
             IpplTimings::startTimer(timer);
             lapsolver.solve();
             IpplTimings::stopTimer(timer);
-            
             itCount = lapsolver.getIterationCount();
         } 
         else {
 #ifdef ENABLE_GINKGO
-PoissonGinkgo<field_type> lapsolver;
+            PoissonGinkgo<field_type> lapsolver;
             ippl::ParameterList params;
             params.add("max_iterations", 500);
             
-            if (selected_solver == "gko_cg") params.add("solver_type", "cg");
-            else if (selected_solver == "gko_gmres") params.add("solver_type", "gmres");
+            if (selected_solver == "gko_mf") {
+                params.add("solver_type", "cg");
+                params.add("matrix_free", true);
+            } else if (selected_solver == "gko_csr") {
+                params.add("solver_type", "cg");
+                params.add("matrix_free", false);
+            } else if (selected_solver == "gko_gmres") {
+                params.add("solver_type", "gmres");
+                params.add("matrix_free", true);
+            }
             
             lapsolver.mergeParameters(params);
             lapsolver.setRhs(rhs); 
             lapsolver.setLhs(lhs);
             lapsolver.setGridParams(pt, ptY, pt, dx, dy, dx);
 
-            // Time ONLY the setup phase
             IpplTimings::TimerRef setup_timer = IpplTimings::getTimer("1. Ginkgo Setup (One-time)");
             IpplTimings::startTimer(setup_timer);
-            lapsolver.setup(); // <--- WE WILL NEED TO SPLIT THIS FUNCTION IN THE CLASS
+            lapsolver.setup();
             IpplTimings::stopTimer(setup_timer);
 
-            // Time ONLY the solve phase
-            std::string t_name = "2. SOLVE: Ginkgo " + selected_solver;
+            std::string t_name = "2. SOLVE: " + selected_solver;
             IpplTimings::TimerRef timer = IpplTimings::getTimer(t_name.c_str());
             
             IpplTimings::startTimer(timer);
@@ -398,7 +387,6 @@ PoissonGinkgo<field_type> lapsolver;
 #endif
         }
 
-        // Error checking
         field_type error(mesh, layout);
         error = lhs - solution;
         double relError = norm(error) / norm(solution);
