@@ -113,7 +113,7 @@ public:
 
     PoissonGinkgo() {
         params_m.add("solver_type", "cg");
-        params_m.add("tolerance", 1e-9);
+        params_m.add("tolerance", 1e-13);
         params_m.add("max_iterations", 500);
         params_m.add("matrix_free", true); 
     }
@@ -179,19 +179,41 @@ public:
             system_matrix = csr_mat;
         }
 
+        // 3. BUILD PRECONDITIONER (ILU)
+        using L_Solver = gko::solver::LowerTrs<value_type, int>;
+        using U_Solver = gko::solver::UpperTrs<value_type, int>;
+        
+        std::shared_ptr<gko::LinOpFactory> prec_factory;
+        if (!is_matrix_free) {
+            prec_factory = gko::share(
+                gko::preconditioner::Ilu<L_Solver, U_Solver>::build().on(exec_)
+            );
+        }
+
+        // 4. CONFIGURE SOLVER FACTORY
+        auto stop_criterion = gko::stop::Iteration::build().with_max_iters(max_iters).on(exec_);
+        auto res_criterion = gko::stop::ResidualNorm<value_type>::build().with_reduction_factor(tolerance).on(exec_);
+
+        auto shared_stop = gko::share(std::move(stop_criterion));
+        auto shared_res = gko::share(std::move(res_criterion));
+
         std::shared_ptr<gko::LinOpFactory> solver_factory;
         if (solver_type == "cg") {
-            solver_factory = gko::solver::Cg<value_type>::build()
-                .with_criteria(
-                    gko::stop::Iteration::build().with_max_iters(max_iters).on(exec_),
-                    gko::stop::ResidualNorm<value_type>::build().with_reduction_factor(tolerance).on(exec_))
-                .on(exec_);
+            auto cg_builder = gko::solver::Cg<value_type>::build()
+                .with_criteria(shared_stop, shared_res);
+            
+            if (prec_factory) {
+                cg_builder.with_preconditioner(prec_factory);
+            }
+            solver_factory = cg_builder.on(exec_);
         } else {
-            solver_factory = gko::solver::Gmres<value_type>::build()
-                .with_criteria(
-                    gko::stop::Iteration::build().with_max_iters(max_iters).on(exec_),
-                    gko::stop::ResidualNorm<value_type>::build().with_reduction_factor(tolerance).on(exec_))
-                .on(exec_);
+            auto gmres_builder = gko::solver::Gmres<value_type>::build()
+                .with_criteria(shared_stop, shared_res);
+                
+            if (prec_factory) {
+                gmres_builder.with_preconditioner(prec_factory);
+            }
+            solver_factory = gmres_builder.on(exec_);
         }
         
         solver_ = solver_factory->generate(system_matrix);
