@@ -1,8 +1,9 @@
 // Tests the conjugate gradient solver for Poisson problems
 // Usage:
-//      ./TestCGSolver 6 native
-//      ./TestCGSolver 6 gko_mf
-//      ./TestCGSolver 6 gko_csr
+//      ./TestCGSolver 7 native
+//      ./TestCGSolver 7 gko_mf none
+//      ./TestCGSolver 7 gko_csr ilu
+//      ./TestCGSolver 7 gko_csr jacobi
 
 #include "Ippl.h"
 
@@ -32,7 +33,6 @@ public:
     IpplLaplaceOp(std::shared_ptr<const gko::Executor> exec)
         : gko::EnableLinOp<IpplLaplaceOp<FieldType>>(exec) {}
 
-    // NEW: We now pass the topology parameters so the Operator knows how to skip ghost cells
     IpplLaplaceOp(std::shared_ptr<const gko::Executor> exec, gko::dim<2> size,
                   FieldType& templated_field, int nx, int ny, int nz, int nghost)
         : gko::EnableLinOp<IpplLaplaceOp<FieldType>>(exec, size),
@@ -46,38 +46,39 @@ public:
 
 protected:
     void apply_impl(const gko::LinOp* in, gko::LinOp* out) const override {
+        static IpplTimings::TimerRef packTimer = IpplTimings::getTimer("Ginkgo MF: Pack/Unpack");
+        static IpplTimings::TimerRef mathTimer = IpplTimings::getTimer("Ginkgo MF: Laplace Math");
+
         auto dense_in = gko::as<gko::matrix::Dense<double>>(in);
         auto dense_out = gko::as<gko::matrix::Dense<double>>(out);
-
         auto view_in = temp_in_->getView();
         const double* gko_in_data = dense_in->get_const_values();
+        int nghost = nghost_; int ny = ny_; int nz = nz_;
         
-        // Copy to local variables for safe CUDA lambda capture
-        int nghost = nghost_;
-        int ny = ny_;
-        int nz = nz_;
-        
-        // Scatter: 1D Contiguous Ginkgo (128^3) -> 3D Padded IPPL (130^3)
+        IpplTimings::startTimer(packTimer);
         Kokkos::parallel_for("CopyIn", temp_in_->getFieldRangePolicy(),
             KOKKOS_LAMBDA(const int i, const int j, const int k) {
                 int row = (i - nghost) * ny * nz + (j - nghost) * nz + (k - nghost);
                 view_in(i, j, k) = gko_in_data[row];
             });
         Kokkos::fence();
-
+        IpplTimings::stopTimer(packTimer);
+        
+        IpplTimings::startTimer(mathTimer);
         *temp_out_ = -laplace(*temp_in_);
         Kokkos::fence();
+        IpplTimings::stopTimer(mathTimer);
 
+        IpplTimings::startTimer(packTimer);
         auto view_out = temp_out_->getView();
         double* gko_out_data = dense_out->get_values();
-        
-        // Gather: 3D Padded IPPL (130^3) -> 1D Contiguous Ginkgo (128^3)
         Kokkos::parallel_for("CopyOut", temp_out_->getFieldRangePolicy(),
             KOKKOS_LAMBDA(const int i, const int j, const int k) {
                 int row = (i - nghost) * ny * nz + (j - nghost) * nz + (k - nghost);
                 gko_out_data[row] = view_out(i, j, k);
             });
         Kokkos::fence();
+        IpplTimings::stopTimer(packTimer);
     }
 
     void apply_impl(const gko::LinOp* alpha, const gko::LinOp* in,
@@ -86,7 +87,6 @@ protected:
         auto dense_alpha = gko::as<gko::matrix::Dense<double>>(alpha);
         auto dense_beta = gko::as<gko::matrix::Dense<double>>(beta);
 
-        // Lazily allocate ONCE and reuse it (using shared_ptr so the class remains copy-assignable)
         if (!temp_math_result_) {
             temp_math_result_ = gko::share(gko::matrix::Dense<double>::create(this->get_executor(), dense_out->get_size()));
         }
@@ -104,7 +104,7 @@ private:
 };
 
 // ============================================================================
-// 2. THE UNIFIED SOLVER (TOGGLES BETWEEN CSR AND MATRIX-FREE)
+// 2. THE UNIFIED SOLVER
 // ============================================================================
 template <typename FieldType>
 class PoissonGinkgo {
@@ -116,6 +116,7 @@ public:
         params_m.add("tolerance", 1e-13);
         params_m.add("max_iterations", 500);
         params_m.add("matrix_free", true); 
+        params_m.add("preconditioner", "none"); 
     }
 
     void mergeParameters(ippl::ParameterList& params) { params_m.merge(params); }
@@ -134,21 +135,26 @@ public:
 
         bool is_matrix_free = params_m.template get<bool>("matrix_free");
         std::string solver_type = params_m.template get<std::string>("solver_type");
+        std::string prec_type = params_m.template get<std::string>("preconditioner");
         double tolerance = params_m.template get<double>("tolerance");
         int max_iters = params_m.template get<int>("max_iterations");
 
         int N = nx_ * ny_ * nz_;
         std::shared_ptr<const gko::LinOp> system_matrix;
 
+        static IpplTimings::TimerRef timerMat = IpplTimings::getTimer("1a. Setup: Matrix Assembly");
+        static IpplTimings::TimerRef timerPrec = IpplTimings::getTimer("1b. Setup: Preconditioner");
+        static IpplTimings::TimerRef timerSolv = IpplTimings::getTimer("1c. Setup: Solver Gen");
+
+        // --- STEP 1: MATRIX ASSEMBLY ---
+        IpplTimings::startTimer(timerMat);
         if (is_matrix_free) {
             int nghost = lhs_mp->getNghost();
             system_matrix = gko::share(IpplLaplaceOp<FieldType>::create(
                 exec_, gko::dim<2>{(size_t)N, (size_t)N}, *lhs_mp, nx_, ny_, nz_, nghost));
         } else {
             gko::matrix_data<value_type, int> md{gko::dim<2>{(size_t)N, (size_t)N}};
-            double inv_dx2 = 1.0 / (dx_ * dx_);
-            double inv_dy2 = 1.0 / (dy_ * dy_);
-            double inv_dz2 = 1.0 / (dz_ * dz_);
+            double inv_dx2 = 1.0 / (dx_ * dx_); double inv_dy2 = 1.0 / (dy_ * dy_); double inv_dz2 = 1.0 / (dz_ * dz_);
             double diag = 2.0 * (inv_dx2 + inv_dy2 + inv_dz2);
 
             for (int i = 0; i < nx_; ++i) {
@@ -157,18 +163,15 @@ public:
                         int row = i * ny_ * nz_ + j * nz_ + k;
                         md.nonzeros.emplace_back(row, row, diag);
 
-                        int im = (i == 0) ? nx_ - 1 : i - 1;
-                        int ip = (i == nx_ - 1) ? 0 : i + 1;
+                        int im = (i == 0) ? nx_ - 1 : i - 1; int ip = (i == nx_ - 1) ? 0 : i + 1;
                         md.nonzeros.emplace_back(row, im * ny_ * nz_ + j * nz_ + k, -inv_dx2);
                         md.nonzeros.emplace_back(row, ip * ny_ * nz_ + j * nz_ + k, -inv_dx2);
 
-                        int jm = (j == 0) ? ny_ - 1 : j - 1;
-                        int jp = (j == ny_ - 1) ? 0 : j + 1;
+                        int jm = (j == 0) ? ny_ - 1 : j - 1; int jp = (j == ny_ - 1) ? 0 : j + 1;
                         md.nonzeros.emplace_back(row, i * ny_ * nz_ + jm * nz_ + k, -inv_dy2);
                         md.nonzeros.emplace_back(row, i * ny_ * nz_ + jp * nz_ + k, -inv_dy2);
 
-                        int km = (k == 0) ? nz_ - 1 : k - 1;
-                        int kp = (k == nz_ - 1) ? 0 : k + 1;
+                        int km = (k == 0) ? nz_ - 1 : k - 1; int kp = (k == nz_ - 1) ? 0 : k + 1;
                         md.nonzeros.emplace_back(row, i * ny_ * nz_ + j * nz_ + km, -inv_dz2);
                         md.nonzeros.emplace_back(row, i * ny_ * nz_ + j * nz_ + kp, -inv_dz2);
                     }
@@ -178,47 +181,55 @@ public:
             csr_mat->read(md);
             system_matrix = csr_mat;
         }
+        IpplTimings::stopTimer(timerMat);
 
-        // 3. BUILD PRECONDITIONER (ILU)
+        // --- STEP 2: BUILD PRECONDITIONER (EXPLICIT TIMING) ---
         using L_Solver = gko::solver::LowerTrs<value_type, int>;
         using U_Solver = gko::solver::UpperTrs<value_type, int>;
         
-        std::shared_ptr<gko::LinOpFactory> prec_factory;
-        if (!is_matrix_free) {
-            prec_factory = gko::share(
-                gko::preconditioner::Ilu<L_Solver, U_Solver>::build().on(exec_)
-            );
+        std::shared_ptr<const gko::LinOp> generated_prec;
+        
+        if (prec_type != "none") {
+            if (is_matrix_free) {
+                std::cout << "WARNING: Preconditioners like ILU/Jacobi require CSR matrix. Skipping." << std::endl;
+            } else {
+                IpplTimings::startTimer(timerPrec);
+                std::shared_ptr<gko::LinOpFactory> prec_factory;
+                if (prec_type == "ilu") {
+                    prec_factory = gko::share(gko::preconditioner::Ilu<L_Solver, U_Solver>::build().on(exec_));
+                } else if (prec_type == "jacobi") {
+                    prec_factory = gko::share(gko::preconditioner::Jacobi<value_type, int>::build().on(exec_));
+                }
+                
+                if (prec_factory) {
+                    // Force the factorization to happen NOW, not during solver generation
+                    generated_prec = gko::share(prec_factory->generate(system_matrix));
+                }
+                IpplTimings::stopTimer(timerPrec);
+            }
         }
 
-        // 4. CONFIGURE SOLVER FACTORY
+        // --- STEP 3: CONFIGURE SOLVER FACTORY ---
+        IpplTimings::startTimer(timerSolv);
         auto stop_criterion = gko::stop::Iteration::build().with_max_iters(max_iters).on(exec_);
         auto res_criterion = gko::stop::ResidualNorm<value_type>::build().with_reduction_factor(tolerance).on(exec_);
 
         auto shared_stop = gko::share(std::move(stop_criterion));
         auto shared_res = gko::share(std::move(res_criterion));
 
-        std::shared_ptr<gko::LinOpFactory> solver_factory;
         if (solver_type == "cg") {
-            auto cg_builder = gko::solver::Cg<value_type>::build()
-                .with_criteria(shared_stop, shared_res);
-            
-            if (prec_factory) {
-                cg_builder.with_preconditioner(prec_factory);
-            }
-            solver_factory = cg_builder.on(exec_);
+            auto cg_builder = gko::solver::Cg<value_type>::build().with_criteria(shared_stop, shared_res);
+            if (generated_prec) cg_builder.with_generated_preconditioner(generated_prec);
+            solver_ = cg_builder.on(exec_)->generate(system_matrix);
         } else {
-            auto gmres_builder = gko::solver::Gmres<value_type>::build()
-                .with_criteria(shared_stop, shared_res);
-                
-            if (prec_factory) {
-                gmres_builder.with_preconditioner(prec_factory);
-            }
-            solver_factory = gmres_builder.on(exec_);
+            auto gmres_builder = gko::solver::Gmres<value_type>::build().with_criteria(shared_stop, shared_res);
+            if (generated_prec) gmres_builder.with_generated_preconditioner(generated_prec);
+            solver_ = gmres_builder.on(exec_)->generate(system_matrix);
         }
         
-        solver_ = solver_factory->generate(system_matrix);
         logger_ = gko::log::Convergence<value_type>::create();
         solver_->add_logger(logger_);
+        IpplTimings::stopTimer(timerSolv);
     }
 
     void solve() {
@@ -226,7 +237,6 @@ public:
         auto view_rhs = rhs_mp->getView();
         auto view_lhs = lhs_mp->getView();
         
-        // BOTH modes must use staging buffers to drop the ghost cell padding!
         staging_b_ = Kokkos::View<double*>("staging_b", N);
         staging_x_ = Kokkos::View<double*>("staging_x", N);
         
@@ -242,13 +252,10 @@ public:
         Kokkos::fence();
 
         auto gko_b = gko::share(gko::matrix::Dense<value_type>::create(
-            exec_, gko::dim<2>{(size_t)N, 1}, 
-            gko::array<value_type>::view(exec_, N, staging_b_.data()), 1));
+            exec_, gko::dim<2>{(size_t)N, 1}, gko::array<value_type>::view(exec_, N, staging_b_.data()), 1));
         auto gko_x = gko::share(gko::matrix::Dense<value_type>::create(
-            exec_, gko::dim<2>{(size_t)N, 1}, 
-            gko::array<value_type>::view(exec_, N, staging_x_.data()), 1));
+            exec_, gko::dim<2>{(size_t)N, 1}, gko::array<value_type>::view(exec_, N, staging_x_.data()), 1));
 
-        // ACTUAL MATH
         solver_->apply(gko_b.get(), gko_x.get());
         itCount_ = logger_->get_num_iterations();
 
@@ -261,8 +268,7 @@ public:
     }
 
 private:
-    FieldType* rhs_mp = nullptr;
-    FieldType* lhs_mp = nullptr;
+    FieldType* rhs_mp = nullptr; FieldType* lhs_mp = nullptr;
     ippl::ParameterList params_m;
     int itCount_ = 0;
     int nx_, ny_, nz_;
@@ -272,8 +278,7 @@ private:
     std::unique_ptr<gko::LinOp> solver_;
     std::shared_ptr<const gko::log::Convergence<value_type>> logger_;
     
-    Kokkos::View<double*> staging_b_;
-    Kokkos::View<double*> staging_x_;
+    Kokkos::View<double*> staging_b_; Kokkos::View<double*> staging_x_;
 };
 #endif // ENABLE_GINKGO
 
@@ -289,20 +294,20 @@ int main(int argc, char* argv[]) {
         using Centering_t          = Mesh_t::DefaultCentering;
 
         int pt = 4, ptY = 4;
-        bool isWeak = false;
         std::string selected_solver = "native"; 
+        std::string selected_prec = "none";
         
         Inform info("Config");
         if (argc >= 2) {
             double N = strtol(argv[1], NULL, 10);
             pt = ptY = 1 << (int)N;
-            if (argc >= 3) {
-                selected_solver = argv[2]; 
-            }
+            if (argc >= 3) selected_solver = argv[2]; 
+            if (argc >= 4) selected_prec = argv[3];
         }
         
         info << "Grid Size (2^N): " << pt << endl;
-        info << "Selected Solver Engine: " << selected_solver << endl;
+        info << "Solver Engine:   " << selected_solver << endl;
+        info << "Preconditioner:  " << selected_prec << endl;
 
         ippl::Index I(pt), Iy(ptY);
         ippl::NDIndex<dim> owned(I, Iy, I);
@@ -359,10 +364,9 @@ int main(int argc, char* argv[]) {
             ippl::ParameterList params;
             params.add("max_iterations", 500);
             lapsolver.mergeParameters(params);
-            lapsolver.setRhs(rhs); 
-            lapsolver.setLhs(lhs);
+            lapsolver.setRhs(rhs); lapsolver.setLhs(lhs);
             
-            IpplTimings::TimerRef timer = IpplTimings::getTimer("1. SOLVE: Native IPPL CG");
+            IpplTimings::TimerRef timer = IpplTimings::getTimer("2. SOLVE: Native IPPL");
             IpplTimings::startTimer(timer);
             lapsolver.solve();
             IpplTimings::stopTimer(timer);
@@ -373,29 +377,23 @@ int main(int argc, char* argv[]) {
             PoissonGinkgo<field_type> lapsolver;
             ippl::ParameterList params;
             params.add("max_iterations", 500);
+            params.add("preconditioner", selected_prec); // Passed down correctly!
             
             if (selected_solver == "gko_mf") {
-                params.add("solver_type", "cg");
-                params.add("matrix_free", true);
+                params.add("solver_type", "cg"); params.add("matrix_free", true);
             } else if (selected_solver == "gko_csr") {
-                params.add("solver_type", "cg");
-                params.add("matrix_free", false);
+                params.add("solver_type", "cg"); params.add("matrix_free", false);
             } else if (selected_solver == "gko_gmres") {
-                params.add("solver_type", "gmres");
-                params.add("matrix_free", true);
+                params.add("solver_type", "gmres"); params.add("matrix_free", true);
             }
             
             lapsolver.mergeParameters(params);
-            lapsolver.setRhs(rhs); 
-            lapsolver.setLhs(lhs);
+            lapsolver.setRhs(rhs); lapsolver.setLhs(lhs);
             lapsolver.setGridParams(pt, ptY, pt, dx, dy, dx);
 
-            IpplTimings::TimerRef setup_timer = IpplTimings::getTimer("1. Ginkgo Setup (One-time)");
-            IpplTimings::startTimer(setup_timer);
             lapsolver.setup();
-            IpplTimings::stopTimer(setup_timer);
 
-            std::string t_name = "2. SOLVE: " + selected_solver;
+            std::string t_name = "2. SOLVE: " + selected_solver + " (" + selected_prec + ")";
             IpplTimings::TimerRef timer = IpplTimings::getTimer(t_name.c_str());
             
             IpplTimings::startTimer(timer);
