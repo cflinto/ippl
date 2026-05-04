@@ -11,6 +11,12 @@ function(add_alpine_example name)
 
   target_link_libraries(${name} PRIVATE IPPL::ippl)
 
+  # --- ADDED GINKGO LINKING FOR STANDARD EXAMPLES ---
+  if(IPPL_ENABLE_GINKGO)
+    target_link_libraries(${name} PRIVATE Ginkgo::ginkgo)
+  endif()
+  # --------------------------------------------------
+
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endfunction()
 
@@ -24,6 +30,13 @@ if(IPPL_ENABLE_TESTS)
     LABELS alpine integration
     WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/alpine/")
   # cmake-format: on
+
+  # --- ADDED GINKGO LINKING FOR THE TEST EXECUTABLE ---
+  if(IPPL_ENABLE_GINKGO)
+    target_link_libraries(LandauDamping PRIVATE Ginkgo::ginkgo)
+  endif()
+  # ----------------------------------------------------
+
 else()
   add_alpine_example(LandauDamping)
 endif()

@@ -115,7 +115,7 @@ public:
 
         this->fcontainer_m->initializeFields(this->solver_m);
 
-        if ((this->getSolver() == "PCG") || (this->getSolver() == "FEM_PRECON")) {
+        if ((this->getSolver() == "PCG") || (this->getSolver() == "FEM_PRECON") || (this->getSolver() == "GKO_PCG")) {
             this->setFieldSolver(std::make_shared<FieldSolver_t>(
                 this->solver_m, &this->fcontainer_m->getRho(), &this->fcontainer_m->getE(),
                 &this->fcontainer_m->getPhi(), this->preconditioner_params_m));

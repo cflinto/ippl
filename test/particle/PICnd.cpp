@@ -356,8 +356,8 @@ public:
 
         } else if (tag == 1) {
             m << "Positions follow normal distribution" << endl;
-            std::vector<double> mu = {0.5, 0.6, 0.2, 0.5, 0.6, 0.2};
-            std::vector<double> sd = {0.75, 0.3, 0.2, 0.75, 0.3, 0.2};
+            std::vector<double> mu = {0.7, 0.7, 0.7, 0.7, 0.7, 0.7};
+            std::vector<double> sd = {0.05, 0.05, 0.05, 0.05, 0.05, 0.05};
             std::vector<double> states(Dim);
 
             Vector_t length = 1;
@@ -475,7 +475,7 @@ int main(int argc, char* argv[]) {
         double localParticles = P->getLocalNum();
         ippl::Comm->reduce(&localParticles, &totalParticles, 1, std::plus<double>());
         msg << "Total particles: " << totalParticles << endl;
-        P->initPositions(FL, hr, nloc, 2);
+        P->initPositions(FL, hr, nloc, 1);
 
         P->qm = P->Q_m / totalP;
         P->P  = 0.0;

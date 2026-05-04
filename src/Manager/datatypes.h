@@ -9,6 +9,10 @@
 #include "PoissonSolvers/FEMPoissonSolver.h"
 #include "PoissonSolvers/PreconditionedFEMPoissonSolver.h"
 
+#ifdef ENABLE_GINKGO
+#include "PoissonSolvers/PoissonGinkgo.h"
+#endif
+
 // some typedefs
 template <unsigned Dim>
 using Mesh_t = ippl::UniformCartesian<double, Dim>;
@@ -67,16 +71,25 @@ using OpenSolver_t =
     ConditionalType<Dim == 3, ippl::FFTOpenPoissonSolver<VField_t<T, Dim>, Field_t<Dim>>>;
 
 template <typename T = double, unsigned Dim = 3>
-using FEMSolver_t = ippl::FEMPoissonSolver<Field<T, Dim>, Field<T, Dim>>; 
+using FEMSolver_t = ippl::FEMPoissonSolver<Field<T, Dim>, Field<T, Dim>>;
 
 template <typename T = double, unsigned Dim = 3>
-using FEMPreconSolver_t = ippl::PreconditionedFEMPoissonSolver<Field<T, Dim>, Field<T, Dim>>; 
+using FEMPreconSolver_t = ippl::PreconditionedFEMPoissonSolver<Field<T, Dim>, Field<T, Dim>>;
+
+#ifdef ENABLE_GINKGO
+template <typename T = double, unsigned Dim = 3>
+using GinkgoSolver_t = PoissonGinkgo<Field_t<Dim>>;
+#endif
 
 template <typename T = double, unsigned Dim = 3>
 using Solver_t = VariantFromConditionalTypes<CGSolver_t<T, Dim>, FFTSolver_t<T, Dim>,
                                              FFTTruncatedGreenSolver_t<T, Dim>,
                                              OpenSolver_t<T, Dim>, NullSolver_t<T, Dim>,
-                                             FEMSolver_t<T, Dim>, FEMPreconSolver_t<T, Dim>>;
+                                             FEMSolver_t<T, Dim>, FEMPreconSolver_t<T, Dim>
+#ifdef ENABLE_GINKGO
+                                             , GinkgoSolver_t<T, Dim>
+#endif
+                                             >;
 
 extern const char* TestName;
 

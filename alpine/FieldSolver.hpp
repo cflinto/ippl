@@ -54,6 +54,10 @@ public:
             initFEMSolver();
         } else if (this->getStype() == "FEM_PRECON") {
             initFEMPreconSolver();
+#ifdef ENABLE_GINKGO
+        } else if (this->getStype() == "GKO_CG" || this->getStype() == "GKO_PCG") {
+            initGinkgoSolver();
+#endif
         } else {
             m << "No solver matches the argument" << endl;
         }
@@ -64,7 +68,7 @@ public:
         // simply assumes them
         typedef ippl::BConds<Field<T, Dim>, Dim> bc_type;
         if ((this->getStype() == "CG") || (this->getStype() == "PCG") || (this->getStype() == "FEM") ||
-            (this->getStype() == "FEM_PRECON")) {
+            (this->getStype() == "FEM_PRECON") || (this->getStype() == "GKO_CG") || (this->getStype() == "GKO_PCG")) {
             bc_type allPeriodic;
             for (unsigned int i = 0; i < 2 * Dim; ++i) {
                 allPeriodic[i]  = std::make_shared<ippl::PeriodicFace<Field<T, Dim>>>(i);
@@ -78,7 +82,7 @@ public:
 
     void runSolver() override {
         if ((this->getStype() == "CG") || (this->getStype() == "PCG") || (this->getStype() == "FEM") ||
-            (this->getStype() == "FEM_PRECON")) {
+            (this->getStype() == "FEM_PRECON") || (this->getStype() == "GKO_CG") || (this->getStype() == "GKO_PCG")) {
             int iterations = 0;
             int residue = 0;
 
@@ -94,6 +98,14 @@ public:
 
                 iterations = solver.getIterationCount();
                 residue    = solver.getResidue();
+#ifdef ENABLE_GINKGO
+            } else if (this->getStype() == "GKO_CG" || this->getStype() == "GKO_PCG") {
+                GinkgoSolver_t<T, Dim>& solver = std::get<GinkgoSolver_t<T, Dim>>(this->getSolver());
+                solver.solve();
+
+                iterations = solver.getIterationCount();
+                residue    = 0; // Ginkgo doesn't expose residue in our wrapper yet
+#endif
             } else {
                 CGSolver_t<T, Dim>& solver = std::get<CGSolver_t<T, Dim>>(this->getSolver());
                 solver.solve();
@@ -106,7 +118,7 @@ public:
                 std::filesystem::create_directory("data_CG");
                 std::stringstream fname;
                 if ((this->getStype() == "CG") || (this->getStype() == "FEM") ||
-                    (this->getStype() == "FEM_PRECON")) {
+                    (this->getStype() == "FEM_PRECON") || (this->getStype() == "GKO_CG")) {
                     fname << "data_CG/CG_";
                 } else {
                     fname << "data_CG/";
@@ -150,20 +162,26 @@ public:
         Solver& solver = std::get<Solver>(this->getSolver());
 
         solver.mergeParameters(sp);
-
         solver.setRhs(*rho_m);
 
         if constexpr ((std::is_same_v<Solver, CGSolver_t<T, Dim>>) || 
                      (std::is_same_v<Solver, FEMSolver_t<T, Dim>>) || 
                      (std::is_same_v<Solver, FEMPreconSolver_t<T, Dim>>)) {
-            // The CG solver and FEMPoissonSolver compute the potential 
-            // directly and use this to get the electric field
+            // The native solvers compute the potential directly and use this to get the electric field
             solver.setLhs(*phi_m);
             solver.setGradient(*E_m);
         } else {
-            // The periodic Poisson solver, Open boundaries solver,
-            // and the TG solver compute the electric field directly
-            solver.setLhs(*E_m);
+#ifdef ENABLE_GINKGO
+            if constexpr (std::is_same_v<Solver, GinkgoSolver_t<T, Dim>>) {
+                // Ginkgo computes phi, but does not calculate the gradient directly
+                solver.setLhs(*phi_m);
+            } else
+#endif
+            {
+                // The periodic Poisson solver, Open boundaries solver,
+                // and the TG solver compute the electric field directly
+                solver.setLhs(*E_m);
+            }
         }
     }
 
@@ -240,6 +258,25 @@ public:
 
         initSolverWithParams<CGSolver_t<T, Dim>>(sp);
     }
+
+#ifdef ENABLE_GINKGO
+    void initGinkgoSolver() {
+        ippl::ParameterList sp;
+        sp.add("solver_type", "cg");
+        sp.add("max_iterations", 500);
+        sp.add("tolerance", 1e-4); // Match CG tolerance
+        sp.add("matrix_free", false); // Defaulting to CSR for now
+
+        if (this->getStype() == "GKO_PCG" && !preconditioner_params_m.empty()) {
+            sp.add("preconditioner", preconditioner_params_m[0]); // e.g., "jacobi", "ilu"
+        } else {
+            sp.add("preconditioner", "none");
+        }
+
+        initSolverWithParams<GinkgoSolver_t<T, Dim>>(sp);
+        // Note: Mesh parameter extraction and setup() are now handled safely inside solve()
+    }
+#endif
 
     void initFEMSolver() {
         ippl::ParameterList sp;
