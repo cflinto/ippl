@@ -78,7 +78,7 @@ using FEMPreconSolver_t = ippl::PreconditionedFEMPoissonSolver<Field<T, Dim>, Fi
 
 #ifdef ENABLE_GINKGO
 template <typename T = double, unsigned Dim = 3>
-using GinkgoSolver_t = PoissonGinkgo<Field_t<Dim>>;
+using GinkgoSolver_t = ippl::PoissonGinkgo<Field_t<Dim>, Field_t<Dim>, VField_t<T, Dim>>;
 #endif
 
 template <typename T = double, unsigned Dim = 3>

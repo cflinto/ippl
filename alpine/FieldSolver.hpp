@@ -165,23 +165,19 @@ public:
         solver.setRhs(*rho_m);
 
         if constexpr ((std::is_same_v<Solver, CGSolver_t<T, Dim>>) || 
-                     (std::is_same_v<Solver, FEMSolver_t<T, Dim>>) || 
-                     (std::is_same_v<Solver, FEMPreconSolver_t<T, Dim>>)) {
-            // The native solvers compute the potential directly and use this to get the electric field
+                      (std::is_same_v<Solver, FEMSolver_t<T, Dim>>) || 
+                      (std::is_same_v<Solver, FEMPreconSolver_t<T, Dim>>)
+#ifdef ENABLE_GINKGO
+                      || (std::is_same_v<Solver, GinkgoSolver_t<T, Dim>>)
+#endif
+                     ) {
+            // All CG-based solvers compute potential directly and need the gradient pointer
             solver.setLhs(*phi_m);
             solver.setGradient(*E_m);
         } else {
-#ifdef ENABLE_GINKGO
-            if constexpr (std::is_same_v<Solver, GinkgoSolver_t<T, Dim>>) {
-                // Ginkgo computes phi, but does not calculate the gradient directly
-                solver.setLhs(*phi_m);
-            } else
-#endif
-            {
-                // The periodic Poisson solver, Open boundaries solver,
-                // and the TG solver compute the electric field directly
-                solver.setLhs(*E_m);
-            }
+            // The periodic Poisson solver, Open boundaries solver,
+            // and the TG solver compute the electric field directly
+            solver.setLhs(*E_m);
         }
     }
 
