@@ -9,6 +9,10 @@
 #include "LaplaceHelpers.h"
 #include "LinearSolvers/PCG.h"
 #include "Poisson.h"
+
+#include <fstream>
+#include <string>
+
 namespace ippl {
 
 // Expands to a lambda that acts as a wrapper for a differential operator
@@ -131,7 +135,68 @@ namespace ippl {
             // \todo TODO add a check for mesh changes for alpha and beta for preconditioners
 
             algo_m->setOperator(IPPL_SOLVER_OPERATOR_WRAPPER(-laplace, lhs_type));
+            
+            // This is the line that actually runs the solver math
             algo_m->operator()(*(this->lhs_mp), *(this->rhs_mp), this->params_m);
+
+            // =================================================================
+            // START OF DATA DUMP INSTRUMENTATION
+            // =================================================================
+            {
+                if (ippl::Comm->rank() == 0) {
+                    auto& fl = this->rhs_mp->getLayout();
+                    const auto& local_domain = fl.getLocalNDIndex();
+                    std::printf("IPPL LAYOUT DECOMPOSITION FOR STANDALONE:\n");
+                    std::printf("local_Nx = %d\n", (int)local_domain[0].length());
+                    std::printf("local_Ny = %d\n", (int)local_domain[1].length());
+                    std::printf("local_Nz = %d\n", (int)local_domain[2].length());
+                    std::printf("========================================\n\n");
+                }
+
+                // Print the exact layout boundaries for every rank
+                auto& fl = this->rhs_mp->getLayout();
+                const auto& local_domain = fl.getLocalNDIndex();
+                std::printf("LAYOUT_CONSTR rank=%d start=%d,%d,%d size=%d,%d,%d\n",
+                            ippl::Comm->rank(),
+                            (int)local_domain[0].first(), (int)local_domain[1].first(), (int)local_domain[2].first(),
+                            (int)local_domain[0].length(), (int)local_domain[1].length(), (int)local_domain[2].length());
+
+                // 1. Get the underlying Kokkos Views for the RHS (Input) and LHS (Output)
+                auto view_rhs = this->rhs_mp->getView(); 
+                auto view_lhs = this->lhs_mp->getView(); 
+
+                // 2. Create Host Mirrors (Safely copies memory to CPU if running on GPUs)
+                auto host_rhs = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), view_rhs);
+                auto host_lhs = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), view_lhs);
+
+                // 3. Get the MPI rank to prevent files from overwriting each other
+                int rank = ippl::Comm->rank();
+                
+                // Track which solve step this is
+                static int step = 0;
+                
+                // 4. Generate unique filenames
+                std::string in_file = "poisson_rhs_step" + std::to_string(step) + "_rank" + std::to_string(rank) + ".bin";
+                std::string out_file = "poisson_lhs_step" + std::to_string(step) + "_rank" + std::to_string(rank) + ".bin";
+
+                // 5. Dump the raw binary arrays (stripping IPPL abstraction)
+                std::ofstream fout_rhs(in_file, std::ios::binary);
+                if (fout_rhs.is_open()) {
+                    fout_rhs.write(reinterpret_cast<const char*>(host_rhs.data()), host_rhs.span() * sizeof(Tlhs));
+                    fout_rhs.close();
+                }
+
+                std::ofstream fout_lhs(out_file, std::ios::binary);
+                if (fout_lhs.is_open()) {
+                    fout_lhs.write(reinterpret_cast<const char*>(host_lhs.data()), host_lhs.span() * sizeof(Tlhs));
+                    fout_lhs.close();
+                }
+                
+                step++;
+            }
+            // =================================================================
+            // END OF DATA DUMP INSTRUMENTATION
+            // =================================================================
 
             int output = this->params_m.template get<int>("output_type");
             if (output & Base::GRAD) {
